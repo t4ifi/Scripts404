@@ -170,7 +170,7 @@ class WindowsUninstaller:
         
     def scan_programs(self):
         """Escanea todos los programas instalados en Windows"""
-        self.status_label.config(text="Escaneando programas instalados...")
+        self.status_label.config(text="Escaneando programas instalados (incluyendo apps de Microsoft Store)...")
         self.scan_button.config(state=tk.DISABLED)
         self.program_listbox.delete(0, tk.END)
         self.programs = []
@@ -179,9 +179,14 @@ class WindowsUninstaller:
             try:
                 # Rutas del registro donde se almacenan programas instalados
                 registry_paths = [
+                    # Programas tradicionales
                     (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
                     (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
                     (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                    # Apps de usuario actual
+                    (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                    # Programas instalados para todos los usuarios
+                    (winreg.HKEY_USERS, r".DEFAULT\Software\Microsoft\Windows\CurrentVersion\Uninstall"),
                 ]
                 
                 for hkey, path in registry_paths:
@@ -241,6 +246,101 @@ class WindowsUninstaller:
                         winreg.CloseKey(key)
                     except:
                         pass
+                
+                # Escanear aplicaciones UWP/Microsoft Store (Xbox, etc.)
+                self.log_message("Escaneando aplicaciones de Microsoft Store...")
+                try:
+                    # Usar PowerShell para obtener apps UWP
+                    powershell_cmd = 'Get-AppxPackage | Select-Object Name, PackageFullName, Publisher, InstallLocation | ConvertTo-Json'
+                    result = subprocess.run(
+                        ['powershell', '-Command', powershell_cmd],
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    
+                    if result.returncode == 0 and result.stdout.strip():
+                        import json
+                        try:
+                            uwp_apps = json.loads(result.stdout)
+                            
+                            # Si es un solo objeto, convertir a lista
+                            if isinstance(uwp_apps, dict):
+                                uwp_apps = [uwp_apps]
+                            
+                            for app in uwp_apps:
+                                if app and 'Name' in app and app['Name']:
+                                    # Filtrar apps del sistema críticas
+                                    name = app['Name']
+                                    
+                                    program_info = {
+                                        'name': name,
+                                        'version': 'UWP App',
+                                        'publisher': app.get('Publisher', 'Microsoft'),
+                                        'install_location': app.get('InstallLocation', 'N/A'),
+                                        'uninstall_string': f"PowerShell:Get-AppxPackage {app.get('PackageFullName', '')} | Remove-AppxPackage",
+                                        'registry_key': f"UWP:{app.get('PackageFullName', '')}",
+                                        'hkey': 'UWP',
+                                        'package_full_name': app.get('PackageFullName', ''),
+                                        'is_uwp': True
+                                    }
+                                    
+                                    self.programs.append(program_info)
+                        except json.JSONDecodeError:
+                            self.log_message("Error al parsear apps UWP")
+                except subprocess.TimeoutExpired:
+                    self.log_message("Timeout al escanear apps UWP")
+                except Exception as e:
+                    self.log_message(f"Error escaneando UWP: {str(e)}")
+                
+                # Escanear programas Windows Installer (MSI)
+                self.log_message("Escaneando programas Windows Installer...")
+                try:
+                    # Apps instaladas vía Windows Installer
+                    msi_paths = [
+                        (winreg.HKEY_CLASSES_ROOT, r"Installer\Products"),
+                    ]
+                    
+                    for hkey, path in msi_paths:
+                        try:
+                            key = winreg.OpenKey(hkey, path)
+                            i = 0
+                            while True:
+                                try:
+                                    subkey_name = winreg.EnumKey(key, i)
+                                    subkey = winreg.OpenKey(key, subkey_name)
+                                    
+                                    try:
+                                        name = winreg.QueryValueEx(subkey, "ProductName")[0]
+                                        
+                                        # Evitar duplicados
+                                        if not any(p['name'] == name for p in self.programs):
+                                            program_info = {
+                                                'name': name,
+                                                'version': 'MSI',
+                                                'publisher': 'N/A',
+                                                'install_location': 'N/A',
+                                                'uninstall_string': 'N/A',
+                                                'registry_key': f"{path}\\{subkey_name}",
+                                                'hkey': hkey,
+                                                'is_msi': True
+                                            }
+                                            
+                                            self.programs.append(program_info)
+                                    except:
+                                        pass
+                                    finally:
+                                        winreg.CloseKey(subkey)
+                                    
+                                    i += 1
+                                except OSError:
+                                    break
+                            
+                            winreg.CloseKey(key)
+                        except:
+                            pass
+                except Exception as e:
+                    self.log_message(f"Error escaneando MSI: {str(e)}")
                 
                 # Ordenar programas alfabéticamente
                 self.programs.sort(key=lambda x: x['name'].lower())
@@ -321,6 +421,10 @@ class WindowsUninstaller:
         
         self.info_text.insert(1.0, info)
     
+    def log_message(self, message):
+        """Envía mensaje de log sin mostrar en interfaz"""
+        pass  # Para debug interno
+    
     def uninstall_program(self):
         """Desinstala el programa seleccionado"""
         if not self.selected_program:
@@ -328,10 +432,12 @@ class WindowsUninstaller:
             return
         
         program_name = self.selected_program['name']
+        is_uwp = self.selected_program.get('is_uwp', False)
         
         response = messagebox.askyesno(
             "Confirmar Desinstalación",
             f"¿Estás seguro de que deseas desinstalar '{program_name}'?\n\n"
+            f"Tipo: {'App de Microsoft Store' if is_uwp else 'Programa tradicional'}\n\n"
             "Esta acción ejecutará el desinstalador oficial del programa."
         )
         
@@ -345,14 +451,34 @@ class WindowsUninstaller:
                 uninstall_string = self.selected_program['uninstall_string']
                 
                 if uninstall_string and uninstall_string != "N/A":
-                    # Ejecutar el desinstalador
-                    subprocess.run(uninstall_string, shell=True)
-                    
-                    self.root.after(0, lambda: messagebox.showinfo(
-                        "Desinstalación Iniciada",
-                        f"Se ha iniciado el desinstalador de '{program_name}'.\n\n"
-                        "Sigue las instrucciones del asistente de desinstalación."
-                    ))
+                    # Si es una app UWP
+                    if is_uwp and 'PowerShell:' in uninstall_string:
+                        ps_command = uninstall_string.replace('PowerShell:', '')
+                        result = subprocess.run(
+                            ['powershell', '-Command', ps_command],
+                            capture_output=True,
+                            text=True
+                        )
+                        
+                        if result.returncode == 0:
+                            self.root.after(0, lambda: messagebox.showinfo(
+                                "Desinstalación Completada",
+                                f"'{program_name}' ha sido desinstalado exitosamente."
+                            ))
+                        else:
+                            self.root.after(0, lambda: messagebox.showerror(
+                                "Error",
+                                f"Error al desinstalar: {result.stderr}"
+                            ))
+                    else:
+                        # Programa tradicional
+                        subprocess.run(uninstall_string, shell=True)
+                        
+                        self.root.after(0, lambda: messagebox.showinfo(
+                            "Desinstalación Iniciada",
+                            f"Se ha iniciado el desinstalador de '{program_name}'.\n\n"
+                            "Sigue las instrucciones del asistente de desinstalación."
+                        ))
                 else:
                     self.root.after(0, lambda: messagebox.showwarning(
                         "No Disponible",
@@ -367,6 +493,7 @@ class WindowsUninstaller:
                 ))
             finally:
                 self.root.after(0, lambda: self.status_label.config(text="Listo."))
+                self.root.after(0, self.scan_programs)  # Refrescar lista
         
         thread = threading.Thread(target=uninstall_thread, daemon=True)
         thread.start()
@@ -379,6 +506,7 @@ class WindowsUninstaller:
         
         program_name = self.selected_program['name']
         install_location = self.selected_program['install_location']
+        is_uwp = self.selected_program.get('is_uwp', False)
         
         response = messagebox.askyesno(
             "⚠️ ADVERTENCIA - Limpieza Profunda",
@@ -401,6 +529,25 @@ class WindowsUninstaller:
             results = []
             
             try:
+                # Si es una app UWP, usar PowerShell
+                if is_uwp:
+                    try:
+                        package_full_name = self.selected_program.get('package_full_name', '')
+                        if package_full_name:
+                            ps_command = f"Get-AppxPackage {package_full_name} | Remove-AppxPackage"
+                            result = subprocess.run(
+                                ['powershell', '-Command', ps_command],
+                                capture_output=True,
+                                text=True
+                            )
+                            
+                            if result.returncode == 0:
+                                results.append(f"✓ App UWP eliminada: {program_name}")
+                            else:
+                                results.append(f"✗ Error eliminando UWP: {result.stderr}")
+                    except Exception as e:
+                        results.append(f"✗ Error eliminando app UWP: {str(e)}")
+                
                 # 1. Eliminar carpeta de instalación
                 if install_location and install_location != "N/A" and os.path.exists(install_location):
                     try:
@@ -409,22 +556,24 @@ class WindowsUninstaller:
                     except Exception as e:
                         results.append(f"✗ Error al eliminar carpeta: {str(e)}")
                 
-                # 2. Eliminar entrada del registro
-                try:
-                    hkey = self.selected_program['hkey']
-                    registry_key = self.selected_program['registry_key']
-                    
-                    # Extraer la ruta base y el subkey
-                    parts = registry_key.split('\\')
-                    base_path = '\\'.join(parts[:-1])
-                    subkey_name = parts[-1]
-                    
-                    key = winreg.OpenKey(hkey, base_path, 0, winreg.KEY_ALL_ACCESS)
-                    winreg.DeleteKey(key, subkey_name)
-                    winreg.CloseKey(key)
-                    results.append(f"✓ Entrada de registro eliminada")
-                except Exception as e:
-                    results.append(f"✗ Error al eliminar registro: {str(e)}")
+                # 2. Eliminar entrada del registro (solo para programas tradicionales)
+                if not is_uwp:
+                    try:
+                        hkey = self.selected_program['hkey']
+                        registry_key = self.selected_program['registry_key']
+                        
+                        if hkey != 'UWP':
+                            # Extraer la ruta base y el subkey
+                            parts = registry_key.split('\\')
+                            base_path = '\\'.join(parts[:-1])
+                            subkey_name = parts[-1]
+                            
+                            key = winreg.OpenKey(hkey, base_path, 0, winreg.KEY_ALL_ACCESS)
+                            winreg.DeleteKey(key, subkey_name)
+                            winreg.CloseKey(key)
+                            results.append(f"✓ Entrada de registro eliminada")
+                    except Exception as e:
+                        results.append(f"✗ Error al eliminar registro: {str(e)}")
                 
                 # 3. Buscar y eliminar carpetas residuales comunes
                 common_paths = [
